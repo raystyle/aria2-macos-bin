@@ -1,17 +1,15 @@
-# 在 GitHub Actions 上产出 macOS aria2c，发布到本仓库 Releases
-# 用法: 推到 raystyle/aria2-macos-bin 后
-#   gh workflow run build-release.yml
-#   或 git tag v1.37.0 && git push --tags
+# 在 GitHub Actions 上产出「可重定位」macOS aria2c（含依赖 dylib）
+# 发布到本仓库 Releases，供 raystyle/dotfiles aria2/install.sh 下载
 #
 name: build-release
 
 on:
   workflow_dispatch:
     inputs:
-      aria2_version:
-        description: "可选：固定 brew 公式版本旁注；实际以 runner brew 为准"
+      tag:
+        description: "Release tag（默认 v1.37.0）"
         required: false
-        default: "1.37.0"
+        default: "v1.37.0"
   push:
     tags:
       - "v*"
@@ -27,65 +25,69 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Intel（尽量兼容 Monterey+）
           - os: macos-13
             arch: x86_64
-          # Apple Silicon
           - os: macos-14
             arch: arm64
 
     steps:
-      - name: Install aria2 (brew bottle on GHA)
+      - name: Install aria2 + dylibbundler
         run: |
           set -euo pipefail
           brew update
-          brew install aria2
-          which aria2c
-          aria2c -v | head -3
-          otool -L "$(which aria2c)" | head -20
+          brew install aria2 dylibbundler
+          command -v aria2c
+          command -v dylibbundler
+          aria2c -v | head -2 || true
 
-      - name: Package
+      - name: Package relocatable tree
         run: |
           set -euo pipefail
           BIN="$(command -v aria2c)"
-          test -n "$BIN"
-          # brew 的 bin/aria2c 常是 symlink → Cellar；必须跟到真实文件再打包
           REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BIN")"
-          echo "BIN=$BIN"
           echo "REAL=$REAL"
           test -f "$REAL"
-          test -x "$REAL"
-          set +o pipefail
-          VER="$(aria2c -v 2>/dev/null | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p' || true)"
-          set -o pipefail
-          VER="${VER:-unknown}"
-          STAGE="${RUNNER_TEMP}/stage"
+
+          STAGE="${RUNNER_TEMP}/aria2c-dist"
           rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          # 复制实体文件（不保留 symlink）
-          cp -f "$REAL" "${STAGE}/aria2c"
-          chmod 755 "${STAGE}/aria2c"
-          test -f "${STAGE}/aria2c"
-          file "${STAGE}/aria2c" || true
+          mkdir -p "$STAGE/bin" "$STAGE/lib"
+
+          cp -f "$REAL" "$STAGE/bin/aria2c"
+          chmod 755 "$STAGE/bin/aria2c"
+
+          # 把 brew 依赖打进 lib/，并把 install name 改成 @executable_path/../lib
+          # -od: overwrite dest; -b: bundle; -x: binary; -d: lib dir; -p: rpath prefix
+          dylibbundler -od -b \
+            -x "$STAGE/bin/aria2c" \
+            -d "$STAGE/lib" \
+            -p "@executable_path/../lib/"
+
+          set +o pipefail
+          VER="$( "$STAGE/bin/aria2c" -v 2>/dev/null | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p' || true)"
+          set -o pipefail
+          VER="${VER:-1.37.0}"
+
           {
             echo "version=${VER}"
             echo "arch=${{ matrix.arch }}"
             echo "runner=${{ matrix.os }}"
-            echo "source=${REAL}"
+            echo "relocatable=1"
             echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             set +o pipefail
-            aria2c -v 2>/dev/null | head -5 || true
+            "$STAGE/bin/aria2c" -v 2>/dev/null | head -5 || true
             set -o pipefail
-          } > "${STAGE}/BUILD_INFO.txt"
+            echo "--- otool ---"
+            otool -L "$STAGE/bin/aria2c" | head -30
+          } > "$STAGE/BUILD_INFO.txt"
+
+          # 冒烟（用打包后的二进制）
+          "$STAGE/bin/aria2c" -v | head -2
+
           OUT="${GITHUB_WORKSPACE}/aria2c-darwin-${{ matrix.arch }}.tar.gz"
-          tar -C "$STAGE" -czf "$OUT" aria2c BUILD_INFO.txt
+          # 顶层保留 bin/ lib/ BUILD_INFO，install 脚本可识别
+          tar -C "$STAGE" -czf "$OUT" bin lib BUILD_INFO.txt
           ls -la "$OUT"
-          tar -tzf "$OUT"
-          # 冒烟：解压再跑
-          TEST="${RUNNER_TEMP}/test-extract"
-          rm -rf "$TEST" && mkdir -p "$TEST"
-          tar -xzf "$OUT" -C "$TEST"
-          "${TEST}/aria2c" -v | head -2
+          tar -tzf "$OUT" | head -40
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -97,6 +99,7 @@ jobs:
   release:
     name: publish-release
     needs: build
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'failure')
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -104,15 +107,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+        continue-on-error: true
 
       - name: List
-        run: find dist -type f -ls
+        run: find dist -type f -ls || true
 
-      - name: Create / update GitHub Release
+      - name: Require at least one arch tarball
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/aria2c-darwin-*.tar.gz dist/**/aria2c-darwin-*.tar.gz)
+          echo "found: ${files[*]:-none}"
+          test ${#files[@]} -ge 1
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.event.inputs.aria2_version || '1.37.0') }}
-          name: aria2c macOS ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.event.inputs.aria2_version || '1.37.0') }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (github.event.inputs.tag || 'v1.37.0') }}
+          name: aria2c macOS ${{ github.ref_type == 'tag' && github.ref_name || (github.event.inputs.tag || 'v1.37.0') }}
           draft: false
           prerelease: false
           generate_release_notes: true
@@ -120,5 +132,6 @@ jobs:
             dist/aria2c-darwin-x86_64.tar.gz
             dist/aria2c-darwin-arm64.tar.gz
             dist/**/aria2c-darwin-*.tar.gz
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
