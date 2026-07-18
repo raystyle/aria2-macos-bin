@@ -1,0 +1,104 @@
+# 在 GitHub Actions 上产出 macOS aria2c，发布到本仓库 Releases
+# 用法: 推到 raystyle/aria2-macos-bin 后
+#   gh workflow run build-release.yml
+#   或 git tag v1.37.0 && git push --tags
+#
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      aria2_version:
+        description: "可选：固定 brew 公式版本旁注；实际以 runner brew 为准"
+        required: false
+        default: "1.37.0"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: aria2c-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Intel（尽量兼容 Monterey+）
+          - os: macos-13
+            arch: x86_64
+          # Apple Silicon
+          - os: macos-14
+            arch: arm64
+
+    steps:
+      - name: Install aria2 (brew bottle on GHA)
+        run: |
+          set -euo pipefail
+          brew update
+          brew install aria2
+          which aria2c
+          aria2c -v | head -3
+          otool -L "$(which aria2c)" | head -20
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          BIN="$(which aria2c)"
+          VER="$(aria2c -v 2>/dev/null | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p')"
+          VER="${VER:-unknown}"
+          STAGE="${RUNNER_TEMP}/stage"
+          mkdir -p "$STAGE"
+          # 复制二进制；尽量保留可执行位
+          cp -a "$BIN" "${STAGE}/aria2c"
+          chmod 755 "${STAGE}/aria2c"
+          # 版本戳
+          {
+            echo "version=${VER}"
+            echo "arch=${{ matrix.arch }}"
+            echo "runner=${{ matrix.os }}"
+            echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            aria2c -v | head -5
+          } > "${STAGE}/BUILD_INFO.txt"
+          cd "$STAGE"
+          tar -czf "${GITHUB_WORKSPACE}/aria2c-darwin-${{ matrix.arch }}.tar.gz" aria2c BUILD_INFO.txt
+          ls -la "${GITHUB_WORKSPACE}/aria2c-darwin-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aria2c-darwin-${{ matrix.arch }}
+          path: aria2c-darwin-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List
+        run: find dist -type f -ls
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.event.inputs.aria2_version || '1.37.0') }}
+          name: aria2c macOS ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.event.inputs.aria2_version || '1.37.0') }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/aria2c-darwin-x86_64.tar.gz
+            dist/aria2c-darwin-arm64.tar.gz
+            dist/**/aria2c-darwin-*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
