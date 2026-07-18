@@ -47,25 +47,30 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          BIN="$(which aria2c)"
-          VER="$(aria2c -v 2>/dev/null | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p')"
+          BIN="$(command -v aria2c)"
+          test -x "$BIN"
+          # 避免 pipefail + head 导致 SIGPIPE 非 0
+          set +o pipefail
+          VER="$(aria2c -v 2>/dev/null | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p' || true)"
+          set -o pipefail
           VER="${VER:-unknown}"
           STAGE="${RUNNER_TEMP}/stage"
           mkdir -p "$STAGE"
-          # 复制二进制；尽量保留可执行位
           cp -a "$BIN" "${STAGE}/aria2c"
           chmod 755 "${STAGE}/aria2c"
-          # 版本戳
           {
             echo "version=${VER}"
             echo "arch=${{ matrix.arch }}"
             echo "runner=${{ matrix.os }}"
             echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            aria2c -v | head -5
+            set +o pipefail
+            aria2c -v 2>/dev/null | head -5 || true
+            set -o pipefail
           } > "${STAGE}/BUILD_INFO.txt"
-          cd "$STAGE"
-          tar -czf "${GITHUB_WORKSPACE}/aria2c-darwin-${{ matrix.arch }}.tar.gz" aria2c BUILD_INFO.txt
-          ls -la "${GITHUB_WORKSPACE}/aria2c-darwin-${{ matrix.arch }}.tar.gz"
+          OUT="${GITHUB_WORKSPACE}/aria2c-darwin-${{ matrix.arch }}.tar.gz"
+          tar -C "$STAGE" -czf "$OUT" aria2c BUILD_INFO.txt
+          ls -la "$OUT"
+          tar -tzf "$OUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
