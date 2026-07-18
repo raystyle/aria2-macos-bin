@@ -48,20 +48,30 @@ jobs:
         run: |
           set -euo pipefail
           BIN="$(command -v aria2c)"
-          test -x "$BIN"
-          # 避免 pipefail + head 导致 SIGPIPE 非 0
+          test -n "$BIN"
+          # brew 的 bin/aria2c 常是 symlink → Cellar；必须跟到真实文件再打包
+          REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BIN")"
+          echo "BIN=$BIN"
+          echo "REAL=$REAL"
+          test -f "$REAL"
+          test -x "$REAL"
           set +o pipefail
           VER="$(aria2c -v 2>/dev/null | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p' || true)"
           set -o pipefail
           VER="${VER:-unknown}"
           STAGE="${RUNNER_TEMP}/stage"
+          rm -rf "$STAGE"
           mkdir -p "$STAGE"
-          cp -a "$BIN" "${STAGE}/aria2c"
+          # 复制实体文件（不保留 symlink）
+          cp -f "$REAL" "${STAGE}/aria2c"
           chmod 755 "${STAGE}/aria2c"
+          test -f "${STAGE}/aria2c"
+          file "${STAGE}/aria2c" || true
           {
             echo "version=${VER}"
             echo "arch=${{ matrix.arch }}"
             echo "runner=${{ matrix.os }}"
+            echo "source=${REAL}"
             echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             set +o pipefail
             aria2c -v 2>/dev/null | head -5 || true
@@ -71,6 +81,11 @@ jobs:
           tar -C "$STAGE" -czf "$OUT" aria2c BUILD_INFO.txt
           ls -la "$OUT"
           tar -tzf "$OUT"
+          # 冒烟：解压再跑
+          TEST="${RUNNER_TEMP}/test-extract"
+          rm -rf "$TEST" && mkdir -p "$TEST"
+          tar -xzf "$OUT" -C "$TEST"
+          "${TEST}/aria2c" -v | head -2
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
